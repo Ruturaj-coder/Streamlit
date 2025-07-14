@@ -1,29 +1,40 @@
 import streamlit as st
 import requests
 
-API_CHAT_URL = "http://localhost:5000/chat"
-API_FILTERS_URL = "http://localhost:5000/filters"
+# ----------------- CONFIG -----------------
+API_CHAT_URL = "http://localhost:7071/api/chat"
+API_FILTERS_URL = "http://localhost:7071/api/filters"
 
+# ----------------- UI SETUP -----------------
 st.set_page_config(page_title="RAG Chatbot", layout="wide")
-st.title("💬 RAG Chatbot with Azure Filters")
+st.title("💬 RAG Chatbot with Azure AI Search (Standalone Friendly)")
 
-# Load filters once
+# ----------------- Filter Fetching -----------------
 @st.cache_data(show_spinner=False)
 def load_filter_values():
-    response = requests.get(API_FILTERS_URL)
-    data = response.json()
-    return data.get("authors", []), data.get("categories", [])
+    try:
+        response = requests.get(API_FILTERS_URL, timeout=3)
+        response.raise_for_status()
+        data = response.json()
+        authors = sorted(data.get("authors", []))
+        categories = sorted(data.get("categories", []))
+    except Exception as e:
+        st.sidebar.warning("⚠️ Backend not available. Using mock filters.")
+        authors = ["Alice", "Bob", "Charlie"]
+        categories = ["AI", "Cloud", "DevOps", "Security"]
+    return authors, categories
 
+# Load filters (real or mock)
 authors, categories = load_filter_values()
 
-# Sidebar for filters
+# ----------------- SIDEBAR FILTERS -----------------
 with st.sidebar:
     st.header("📂 Filters")
-    selected_author = st.selectbox("Document Author", [""] + authors)
-    selected_category = st.selectbox("Document Category", [""] + categories)
-    selected_date = st.text_input("Document Date (e.g. 2024-01-01)")
+    selected_author = st.selectbox("📌 Document Author", [""] + authors)
+    selected_category = st.selectbox("📁 Document Category", [""] + categories)
+    selected_date = st.text_input("📅 Document Date (e.g. 2024-01-01)")
 
-# User input
+# ----------------- MAIN CHAT -----------------
 query = st.text_input("🔍 Ask a question")
 
 if st.button("Ask"):
@@ -44,9 +55,11 @@ if st.button("Ask"):
         }
 
         with st.spinner("Thinking..."):
-            response = requests.post(API_CHAT_URL, json=payload)
-            if response.status_code == 200:
+            try:
+                response = requests.post(API_CHAT_URL, json=payload, timeout=10)
+                response.raise_for_status()
                 data = response.json()
+
                 st.success("✅ Answer")
                 st.markdown(f"**{data['answer']}**")
 
@@ -59,5 +72,8 @@ if st.button("Ask"):
                         st.markdown(f"- **Date:** {doc['date']}")
                         st.markdown(f"> {doc['content'][:300]}...")
                         st.markdown("---")
-            else:
-                st.error(f"Error: {response.text}")
+                else:
+                    st.info("No documents found.")
+
+            except requests.exceptions.RequestException as e:
+                st.error("❌ Could not connect to backend. Please start your Azure Function App.")
