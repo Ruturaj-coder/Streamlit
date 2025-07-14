@@ -1,38 +1,83 @@
 import azure.functions as func
 import json
 import os
+import openai
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
-    key = os.getenv("AZURE_SEARCH_KEY")
-    index = os.getenv("AZURE_SEARCH_INDEX")
-
-    search_client = SearchClient(endpoint, index, AzureKeyCredential(key))
-
-    authors = set()
-    categories = set()
-
     try:
-        results = search_client.search("*", top=1000)
+        body = req.get_json()
+        query = body.get("query", "")
+        filters = body.get("filters", {})
+
+        search_client = SearchClient(
+            endpoint=os.getenv("AZURE_SEARCH_ENDPOINT"),
+            index_name=os.getenv("AZURE_SEARCH_INDEX"),
+            credential=AzureKeyCredential(os.getenv("AZURE_SEARCH_KEY"))
+        )
+
+        # Construct filter string
+        filter_clauses = []
+        if "author" in filters:
+            filter_clauses.append(f"author eq '{filters['author']}'")
+        if "category" in filters:
+            filter_clauses.append(f"category eq '{filters['category']}'")
+        if "date" in filters:
+            filter_clauses.append(f"date eq '{filters['date']}'")
+        filter_string = " and ".join(filter_clauses) if filter_clauses else None
+
+        results = search_client.search(
+            query=query,
+            filter=filter_string,
+            top=5
+        )
+
+        documents = []
+        combined_context = ""
+
         for doc in results:
-            if "author" in doc and doc["author"]:
-                authors.add(doc["author"])
-            if "category" in doc and doc["category"]:
-                categories.add(doc["category"])
+            title = doc.get("title", "Untitled")
+            content = doc.get("content", "")
+            documents.append({
+                "title": title,
+                "content": content,
+                "author": doc.get("author", ""),
+                "category": doc.get("category", ""),
+                "date": doc.get("date", "")
+            })
+            combined_context += f"\n\n{title}:\n{content}"
+
+        # LLM call (OpenAI)
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        openai.api_base = os.getenv("OPENAI_API_BASE")
+        openai.api_type = "azure"
+        openai.api_version = os.getenv("OPENAI_API_VERSION")
+
+        response = openai.ChatCompletion.create(
+            engine=os.getenv("OPENAI_DEPLOYMENT_NAME"),
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": f"Context:\n{combined_context}\n\nQ: {query}\nA:"}
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+
+        answer = response["choices"][0]["message"]["content"]
+
+        return func.HttpResponse(
+            body=json.dumps({
+                "answer": answer,
+                "documents": documents
+            }),
+            status_code=200,
+            mimetype="application/json"
+        )
+
     except Exception as e:
         return func.HttpResponse(
             body=json.dumps({"error": str(e)}),
             status_code=500,
             mimetype="application/json"
         )
-
-    return func.HttpResponse(
-        body=json.dumps({
-            "authors": sorted(authors),
-            "categories": sorted(categories)
-        }),
-        status_code=200,
-        mimetype="application/json"
-    )
