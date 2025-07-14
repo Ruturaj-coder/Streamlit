@@ -1,0 +1,38 @@
+import azure.functions as func
+import json
+import os
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
+    key = os.getenv("AZURE_SEARCH_KEY")
+    index = os.getenv("AZURE_SEARCH_INDEX")
+
+    search_client = SearchClient(endpoint, index, AzureKeyCredential(key))
+
+    authors = set()
+    categories = set()
+
+    try:
+        results = search_client.search("*", top=1000)
+        for doc in results:
+            if "author" in doc and doc["author"]:
+                authors.add(doc["author"])
+            if "category" in doc and doc["category"]:
+                categories.add(doc["category"])
+    except Exception as e:
+        return func.HttpResponse(
+            body=json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+    return func.HttpResponse(
+        body=json.dumps({
+            "authors": sorted(authors),
+            "categories": sorted(categories)
+        }),
+        status_code=200,
+        mimetype="application/json"
+    )
