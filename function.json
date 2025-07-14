@@ -4,8 +4,8 @@
     {
       "authLevel": "anonymous",
       "type": "httpTrigger",
-      "methods": ["get"],
-      "route": "filters",
+      "methods": ["post"],
+      "route": "chat",
       "name": "req"
     },
     {
