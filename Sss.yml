@@ -1,0 +1,32 @@
+# sandbox_provision.yml
+- name: Provision AWS Sandbox for GenAI
+  hosts: localhost
+  connection: local
+  vars:
+    tenant_name: "team-xyz"
+    role_name: "genai-sandbox-role-team-xyz"
+    portfolio_id: "port-abc123"
+    product_id: "prod-bedrock-tagging"
+
+  tasks:
+    - name: Create IAM Role using CloudFormation
+      amazon.aws.cloudformation:
+        stack_name: "{{ role_name }}"
+        state: present
+        template_body: "{{ lookup('file', 'iam-role-template.yml') }}"
+        capabilities: CAPABILITY_NAMED_IAM
+
+    - name: Grant Portfolio Access
+      community.aws.service_catalog_portfolio:
+        portfolio_id: "{{ portfolio_id }}"
+        principal_arn: "arn:aws:iam::123456789012:role/{{ role_name }}"
+        principal_type: IAM
+        state: present
+
+    - name: Tag Bedrock Product
+      community.aws.service_catalog_provisioned_product:
+        product_id: "{{ product_id }}"
+        provisioning_parameters:
+          - key: "IAMRole"
+            value: "{{ role_name }}"
+        state: present
