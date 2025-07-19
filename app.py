@@ -1,257 +1,149 @@
-import azure.functions as func
-import json
-import logging
+import streamlit as st
 import os
-from azure.search.documents import SearchClient
+from openai import AzureOpenAI
 from azure.core.credentials import AzureKeyCredential
-from azure.identity import DefaultAzureCredential
-import openai
-from typing import Dict, List, Any, Optional
+from azure.search.documents import SearchClient
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- UI Configuration ---
+st.set_page_config(page_title="Azure RAG Chatbot", page_icon="🤖", layout="wide")
+st.title("🤖 RAG Chatbot with Azure AI Search")
 
-# Initialize Function App
-app = func.FunctionApp()
+# --- Azure Credentials & Services Setup (Sidebar) ---
+with st.sidebar:
+    st.header("Azure Configuration ⚙️")
 
-# Global variables for clients
-search_client = None
-openai_client = None
-
-def get_search_client():
-    """Initialize and return Azure Search client"""
-    global search_client
-    if search_client is None:
-        search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
-        search_key = os.getenv("AZURE_SEARCH_KEY")
-        search_index = os.getenv("AZURE_SEARCH_INDEX")
-        
-        if not all([search_endpoint, search_key, search_index]):
-            raise ValueError("Missing required Azure Search configuration")
-        
-        credential = AzureKeyCredential(search_key)
-        search_client = SearchClient(
-            endpoint=search_endpoint,
-            index_name=search_index,
-            credential=credential
-        )
-    return search_client
-
-def get_openai_client():
-    """Initialize and return OpenAI client"""
-    global openai_client
-    if openai_client is None:
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise ValueError("Missing OpenAI API key")
-        
-        openai_client = openai.OpenAI(api_key=openai_api_key)
-    return openai_client
-
-def build_search_filter(filters: Dict[str, str]) -> Optional[str]:
-    """Build OData filter string from filters"""
-    filter_parts = []
+    # Input fields for Azure credentials
+    azure_search_endpoint = st.text_input(
+        "Azure AI Search Endpoint",
+        type="password",
+        placeholder="https://your-search-service.search.windows.net"
+    )
+    azure_search_key = st.text_input(
+        "Azure AI Search Key",
+        type="password"
+    )
+    azure_search_index = st.text_input(
+        "Azure AI Search Index Name",
+        placeholder="your-index-name"
+    )
     
-    for key, value in filters.items():
-        if value and value.strip():
-            # Escape single quotes in the value
-            escaped_value = value.replace("'", "''")
-            filter_parts.append(f"{key} eq '{escaped_value}'")
-    
-    return " and ".join(filter_parts) if filter_parts else None
+    st.markdown("---")
 
-def search_documents(query: str, filters: Dict[str, str], top: int = 5) -> List[Dict[str, Any]]:
-    """Search documents using Azure AI Search"""
+    azure_openai_endpoint = st.text_input(
+        "Azure OpenAI Endpoint",
+        type="password",
+        placeholder="https://your-openai-service.openai.azure.com/"
+    )
+    azure_openai_key = st.text_input(
+        "Azure OpenAI Key",
+        type="password"
+    )
+    azure_openai_deployment = st.text_input(
+        "Azure OpenAI Deployment Name",
+        placeholder="your-gpt-deployment-name"
+    )
+
+    # Check if all credentials are provided
+    all_credentials_provided = (
+        azure_search_endpoint and azure_search_key and azure_search_index and
+        azure_openai_endpoint and azure_openai_key and azure_openai_deployment
+    )
+
+    if not all_credentials_provided:
+        st.warning("Please enter all Azure credentials to start the chatbot.")
+        st.stop()
+
+# --- Backend RAG Logic ---
+def get_rag_response(question, search_client, openai_client, openai_deployment):
+    """
+    Retrieves context from Azure AI Search and generates a response using Azure OpenAI.
+    """
     try:
-        client = get_search_client()
-        
-        # Build filter
-        search_filter = build_search_filter(filters)
-        
-        # Perform search
-        results = client.search(
-            search_text=query,
-            top=top,
-            filter=search_filter,
-            select=["id", "title", "content", "author", "category", "date"],
-            search_mode="all"
+        # 1. RETRIEVAL: Search for relevant documents
+        # Assuming your search index has a "content" field with the text.
+        # Adjust 'select' and the field name in the context loop as needed.
+        search_results = search_client.search(
+            search_text=question,
+            top=3,  # Get the top 3 most relevant documents
+            select="content"
         )
-        
-        documents = []
-        for result in results:
-            documents.append({
-                "id": result.get("id", ""),
-                "title": result.get("title", ""),
-                "content": result.get("content", ""),
-                "author": result.get("author", ""),
-                "category": result.get("category", ""),
-                "date": result.get("date", "")
-            })
-        
-        return documents
-        
-    except Exception as e:
-        logger.error(f"Search error: {str(e)}")
-        raise
 
-def generate_answer(query: str, documents: List[Dict[str, Any]]) -> str:
-    """Generate answer using OpenAI with retrieved documents"""
-    try:
-        client = get_openai_client()
-        
-        # Prepare context from documents
-        context = ""
-        for i, doc in enumerate(documents, 1):
-            context += f"Document {i}:\n"
-            context += f"Title: {doc['title']}\n"
-            context += f"Author: {doc['author']}\n"
-            context += f"Category: {doc['category']}\n"
-            context += f"Content: {doc['content']}\n\n"
-        
-        # Create prompt
-        prompt = f"""Based on the following documents, please answer the user's question. 
-If the documents don't contain enough information to answer the question, please say so.
+        # 2. AUGMENTATION: Build the context string from search results
+        retrieved_context = ""
+        for result in search_results:
+            retrieved_context += f"\n\n---\n\n{result['content']}"
 
-Context Documents:
-{context}
+        if not retrieved_context:
+            return "I couldn't find any relevant information in my knowledge base to answer your question."
 
-User Question: {query}
-
-Please provide a comprehensive answer based on the documents above:"""
+        # 3. GENERATION: Create a prompt and get a response from the LLM
+        system_prompt = """
+        You are a helpful AI assistant. Answer the user's question based ONLY on the context provided below.
+        If the answer is not found in the context, respond with "I couldn't find an answer in the provided documents."
+        Do not make up information. Be concise and professional.
+        """
         
-        # Generate response
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on provided documents."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500,
-            temperature=0.3
+        # Combine system prompt, context, and the user's question
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Context:\n{retrieved_context}\n\nQuestion:\n{question}"}
+        ]
+
+        response = openai_client.chat.completions.create(
+            model=openai_deployment,
+            messages=messages,
+            temperature=0.2, # Lower temperature for more factual answers
+            max_tokens=500
         )
         
         return response.choices[0].message.content
-        
-    except Exception as e:
-        logger.error(f"OpenAI error: {str(e)}")
-        return f"Sorry, I couldn't generate an answer due to an error: {str(e)}"
 
-def get_filter_values() -> Dict[str, List[str]]:
-    """Get unique values for filters from the search index"""
-    try:
-        client = get_search_client()
-        
-        # Get all documents (you might want to limit this in production)
-        results = client.search(
-            search_text="*",
-            select=["author", "category"],
-            top=1000
-        )
-        
-        authors = set()
-        categories = set()
-        
-        for result in results:
-            if result.get("author"):
-                authors.add(result["author"])
-            if result.get("category"):
-                categories.add(result["category"])
-        
-        return {
-            "authors": sorted(list(authors)),
-            "categories": sorted(list(categories))
-        }
-        
     except Exception as e:
-        logger.error(f"Filter values error: {str(e)}")
-        # Return empty lists if there's an error
-        return {"authors": [], "categories": []}
+        st.error(f"An error occurred: {e}")
+        return "Sorry, I ran into an issue while processing your request."
 
-@app.route(route="chat", methods=["POST"])
-def chat_endpoint(req: func.HttpRequest) -> func.HttpResponse:
-    """Handle chat requests"""
-    try:
-        # Parse request
-        try:
-            req_body = req.get_json()
-        except ValueError:
-            return func.HttpResponse(
-                json.dumps({"error": "Invalid JSON"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        if not req_body:
-            return func.HttpResponse(
-                json.dumps({"error": "Request body is required"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        query = req_body.get("query", "").strip()
-        filters = req_body.get("filters", {})
-        
-        if not query:
-            return func.HttpResponse(
-                json.dumps({"error": "Query is required"}),
-                status_code=400,
-                mimetype="application/json"
-            )
-        
-        # Search documents
-        documents = search_documents(query, filters)
-        
-        # Generate answer
-        answer = generate_answer(query, documents)
-        
-        # Return response
-        response = {
-            "answer": answer,
-            "documents": documents,
-            "query": query,
-            "filters": filters
-        }
-        
-        return func.HttpResponse(
-            json.dumps(response),
-            status_code=200,
-            mimetype="application/json"
-        )
-        
-    except Exception as e:
-        logger.error(f"Chat endpoint error: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": f"Internal server error: {str(e)}"}),
-            status_code=500,
-            mimetype="application/json"
-        )
-
-@app.route(route="filters", methods=["GET"])
-def filters_endpoint(req: func.HttpRequest) -> func.HttpResponse:
-    """Handle filter values requests"""
-    try:
-        filter_values = get_filter_values()
-        
-        return func.HttpResponse(
-            json.dumps(filter_values),
-            status_code=200,
-            mimetype="application/json"
-        )
-        
-    except Exception as e:
-        logger.error(f"Filters endpoint error: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": f"Internal server error: {str(e)}"}),
-            status_code=500,
-            mimetype="application/json"
-        )
-
-@app.route(route="health", methods=["GET"])
-def health_endpoint(req: func.HttpRequest) -> func.HttpResponse:
-    """Health check endpoint"""
-    return func.HttpResponse(
-        json.dumps({"status": "healthy"}),
-        status_code=200,
-        mimetype="application/json"
+# --- Initialize Clients ---
+try:
+    search_credential = AzureKeyCredential(azure_search_key)
+    search_client = SearchClient(endpoint=azure_search_endpoint, index_name=azure_search_index, credential=search_credential)
+    
+    openai_client = AzureOpenAI(
+        api_key=azure_openai_key,
+        api_version="2024-02-01", # Use a recent, stable API version
+        azure_endpoint=azure_openai_endpoint
     )
+except Exception as e:
+    st.error(f"Failed to initialize Azure clients. Please check your credentials. Error: {e}")
+    st.stop()
+
+
+# --- Chat Interface ---
+# Initialize chat history in session state
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I help you today based on my knowledge base?"}]
+
+# Display chat messages from history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Accept user input
+if prompt := st.chat_input("Ask a question about your documents..."):
+    # Add user message to chat history and display it
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Get RAG response and display it
+    with st.chat_message("assistant"):
+        with st.spinner("Searching and thinking..."):
+            response = get_rag_response(
+                question=prompt,
+                search_client=search_client,
+                openai_client=openai_client,
+                openai_deployment=azure_openai_deployment
+            )
+            st.markdown(response)
+    
+    # Add assistant response to chat history
+    st.session_state.messages.append({"role": "assistant", "content": response})
