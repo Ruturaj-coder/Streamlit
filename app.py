@@ -6,16 +6,19 @@ from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizableTextQuery
 
-# --- Load Environment Variables ---
+# --- 1. SETUP AND CONFIGURATION ---
+
 # Load environment variables from .env file
-load_dotenv() 
+load_dotenv()
 
-# --- UI Configuration ---
+# UI Configuration
 st.set_page_config(page_title="Azure RAG Chatbot", page_icon="🤖", layout="wide")
-st.title("🤖 Hybrid Search RAG Chatbot")
+st.title("🤖 Advanced RAG Chatbot")
 
-# --- Azure Credentials & Services Setup (from .env) ---
+# --- 2. AZURE SERVICES INITIALIZATION ---
+
 try:
+    # Load credentials from .env file
     azure_search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
     azure_search_key = os.getenv("AZURE_SEARCH_KEY")
     azure_search_index = os.getenv("AZURE_SEARCH_INDEX")
@@ -24,55 +27,36 @@ try:
     azure_openai_key = os.getenv("AZURE_OPENAI_KEY")
     azure_openai_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
 
-    # Check if all credentials are loaded
+    # Check for missing credentials
     if not all([azure_search_endpoint, azure_search_key, azure_search_index,
                 azure_openai_endpoint, azure_openai_key, azure_openai_deployment]):
         st.error("🔴 Critical Error: One or more environment variables are missing.")
-        st.error("Please check your .env file and make sure it contains all required credentials.")
+        st.info("Please check your .env file and ensure all required credentials are set.")
         st.stop()
 
-    # --- Initialize Clients ---
+    # Initialize clients
     search_credential = AzureKeyCredential(azure_search_key)
     search_client = SearchClient(endpoint=azure_search_endpoint, index_name=azure_search_index, credential=search_credential)
-    
-    openai_client = AzureOpenAI(
-        api_key=azure_openai_key,
-        api_version="2024-02-01", 
-        azure_endpoint=azure_openai_endpoint
-    )
+    openai_client = AzureOpenAI(api_key=azure_openai_key, api_version="2024-02-01", azure_endpoint=azure_openai_endpoint)
 
 except Exception as e:
-    st.error(f"🔴 Failed to initialize Azure clients. Please check your credentials in the .env file. Error: {e}")
+    st.error(f"🔴 Failed to initialize Azure clients: {e}")
     st.stop()
 
+# --- 3. HELPER FUNCTIONS ---
 
-# --- Backend RAG Logic (Updated with Hybrid Search) ---
-def get_rag_response(question, search_client, openai_client, openai_deployment):
-    """
-    Performs hybrid search and generates a response using Azure OpenAI.
-    Returns the response text and a list of sources.
-    """
+def retrieve_documents(question):
+    """Performs hybrid search and returns the retrieved context and sources."""
     try:
-        # 1. RETRIEVAL: Perform hybrid search
-        vector_query = VectorizableTextQuery(
-            text=question, 
-            k_nearest_neighbors=5, 
-            fields="vector" # IMPORTANT: Assumes your vector field is named "vector"
+        vector_query = VectorizableTextQuery(text=question, k_nearest_neighbors=5, fields="vector")
+        
+        results = search_client.search(
+            search_text=question,
+            vector_queries=[vector_query],
+            select=["title", "chunk", "document_title", "author", "topic"],
+            top=5
         )
 
-        search_args = {
-            "search_text": question,
-            "vector_queries": [vector_query],
-            "select": [
-                "title", "chunk", "parent_id", "chunk_id", "document_title", 
-                "author", "topic" # Add other fields as needed
-            ],
-            "top": 5
-        }
-        
-        results = search_client.search(**search_args)
-
-        # 2. AUGMENTATION: Prepare context and track sources
         retrieved_context = ""
         sources = []
         for result in results:
@@ -80,84 +64,111 @@ def get_rag_response(question, search_client, openai_client, openai_deployment):
             sources.append({
                 "title": result.get('title', 'N/A'),
                 "document_title": result.get('document_title', 'N/A'),
-                "chunk_id": result.get('chunk_id', 'N/A'),
                 "author": result.get('author', 'N/A'),
-                "topic": result.get('topic', 'N/A')
+                "relevance_score": result.get('@search.score', 0.0)
             })
+        return retrieved_context, sources
+    except Exception as e:
+        st.error(f"An error occurred during document retrieval: {e}")
+        return None, None
 
-        if not retrieved_context:
-            return "I couldn't find any relevant information in the documents. Please try adjusting your query.", []
+def stream_llm_response(question, context):
+    """Streams the LLM response based on the provided question and context."""
+    system_prompt = """
+    You are a helpful AI assistant. Answer the user's question based ONLY on the context provided below.
+    Format your answers clearly using markdown, including bullet points, bolding, and line breaks where appropriate.
+    If the answer is not in the context, say 'I don't have enough information in the provided documents to answer that.'
+    Do not make up information.
+    """
+    augmented_prompt = f"CONTEXT FROM DOCUMENTS:\n{context}\n\nQUESTION:\n{question}"
 
-        # 3. GENERATION: Create a prompt and get a response from the LLM
-        system_prompt = """
-        You are a helpful AI assistant. Answer the user's question based ONLY on the context provided below.
-        If the answer is not in the context, say 'I don't have enough information in the provided documents to answer that.'
-        Do not make up information. Provide clear, concise answers.
-        """
-        
-        augmented_prompt = f"CONTEXT FROM DOCUMENTS:\n{retrieved_context}\n\nQUESTION:\n{question}"
-
-        response = openai_client.chat.completions.create(
-            model=openai_deployment,
+    try:
+        stream = openai_client.chat.completions.create(
+            model=azure_openai_deployment,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": augmented_prompt}
             ],
             temperature=0.2,
-            max_tokens=1000
+            max_tokens=1500,
+            stream=True
         )
-        
-        return response.choices[0].message.content, sources
-
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
     except Exception as e:
-        st.error(f"An error occurred during search: {e}")
-        return "Sorry, I ran into an issue while processing your request.", []
+        yield f"An error occurred while generating the response: {e}"
 
-# --- Chat Interface ---
+# --- 4. SESSION STATE INITIALIZATION ---
+
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I help you today?"}]
+if "latest_sources" not in st.session_state:
+    st.session_state.latest_sources = []
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        # Display sources if they exist in the message
-        if "sources" in message and message["sources"]:
-            with st.expander("Sources"):
-                for i, source in enumerate(message["sources"]):
-                    st.write(f"**Source {i+1}:**")
-                    st.write(f"- **Title:** {source.get('title', 'N/A')}")
-                    st.write(f"- **Document:** {source.get('document_title', 'N/A')}")
-                    st.write(f"- **Author:** {source.get('author', 'N/A')}")
-                    st.write(f"- **Topic:** {source.get('topic', 'N/A')}")
+# --- 5. UI RENDERING ---
 
+# Main layout: Two columns for chat and sources
+col1, col2 = st.columns([2, 1])
 
-if prompt := st.chat_input("Ask a question..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# Column 1: Chat Interface
+with col1:
+    st.header("Chat")
 
-    with st.chat_message("assistant"):
-        with st.spinner("Searching and thinking..."):
-            response_text, sources = get_rag_response(
-                question=prompt,
-                search_client=search_client,
-                openai_client=openai_client,
-                openai_deployment=azure_openai_deployment
-            )
-            
-            st.markdown(response_text)
+    # Display chat messages from history
+    for message in st.session_state.messages:
+        avatar = "🧑‍💻" if message["role"] == "user" else "🤖"
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"])
 
-            if sources:
-                with st.expander("Sources"):
-                    for i, source in enumerate(sources):
-                        st.write(f"**Source {i+1}:**")
-                        st.write(f"- **Title:** {source.get('title', 'N/A')}")
-                        st.write(f"- **Document:** {source.get('document_title', 'N/A')}")
-                        st.write(f"- **Author:** {source.get('author', 'N/A')}")
-                        st.write(f"- **Topic:** {source.get('topic', 'N/A')}")
-    
-    st.session_state.messages.append({
-        "role": "assistant", 
-        "content": response_text, 
-        "sources": sources
-    })
+    # Chat input
+    if prompt := st.chat_input("Ask a question..."):
+        # Add user message to history and display it
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user", avatar="🧑‍💻"):
+            st.markdown(prompt)
+
+        # Start generating the assistant's response
+        with st.chat_message("assistant", avatar="🤖"):
+            with st.spinner("Searching for documents..."):
+                context, sources = retrieve_documents(prompt)
+                st.session_state.latest_sources = sources
+
+            if context is None:
+                st.error("Could not retrieve documents. Please check the connection to Azure AI Search.")
+            else:
+                # Use a placeholder for the streaming response
+                response_placeholder = st.empty()
+                full_response = ""
+                # Stream the LLM response
+                for chunk in stream_llm_response(prompt, context):
+                    full_response += chunk
+                    response_placeholder.markdown(full_response + "▌") # Add a cursor effect
+                response_placeholder.markdown(full_response) # Final response
+
+        # Add the final assistant response to the message history
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        st.rerun()
+
+# Column 2: Sources and Controls
+with col2:
+    st.header("Sources & Controls")
+
+    # Clear conversation button
+    if st.button("🧹 Clear Conversation", use_container_width=True):
+        st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I help you today?"}]
+        st.session_state.latest_sources = []
+        st.rerun()
+
+    st.markdown("---")
+
+    # Display sources for the latest response
+    if st.session_state.latest_sources:
+        st.subheader("Retrieved Documents")
+        for i, source in enumerate(st.session_state.latest_sources):
+            with st.container(border=True):
+                st.markdown(f"**Source {i+1}:** {source.get('document_title', 'N/A')}")
+                st.markdown(f"**Title:** {source.get('title', 'N/A')}")
+                st.progress(source.get('relevance_score', 0.0), text=f"**Relevance:** {source.get('relevance_score', 0.0):.2f}")
+    else:
+        st.info("Sources for the latest answer will appear here.")
